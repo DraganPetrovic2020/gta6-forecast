@@ -19,10 +19,10 @@ const HOUR_MS = 3_600_000;
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
 
 interface Point { from: string; viewers: number; channels: number | null }
-interface Comparable { name: string; day_start: string; unlock?: string; source?: string; hourly: Point[] }
+interface Comparable { name: string; day_start: string; unlock?: string; platforms?: string; hourly: Point[] }
 interface Case {
   id: string;
-  game: { name: string };
+  game: { name: string; platforms?: string };
   day_start: string;
   levels: number[];
   known: Array<{ hour: number; viewers: number }>;
@@ -34,7 +34,9 @@ interface Case {
 
 export interface Params {
   sizeBandwidth: number; // kernel width on ln(hour-1 viewers)
+  sizeFloor: number; // the size kernel's least weight, so far-off analogs still count a little
   momentumBandwidth: number; // kernel width on ln(hour 1 / hour 0)
+  platformMismatchWeight: number; // weight of an analog whose PC-or-not launch differs from the target's
   kernelBase: number; // smoothing sd (log units) at hour 2
   kernelSlope: number; // added smoothing sd per sqrt(hour - 1)
   shrink: number; // multiplies every analog log ratio (1 = none)
@@ -49,8 +51,10 @@ export const DEFAULTS: Params = {
   // Tuned by leave-one-out over the comparables (each launch forecast from the others), favouring the rolling
   // midnight-local launches that resemble Grand Theft Auto VI's; kept off the exact optimum, which 11 such launches
   // cannot pin down.
-  sizeBandwidth: 0.75,
+  sizeBandwidth: 1.0,
+  sizeFloor: 0,
   momentumBandwidth: 0.4,
+  platformMismatchWeight: 0.4,
   kernelBase: 0.12,
   kernelSlope: 0.03,
   shrink: 0.9,
@@ -61,7 +65,7 @@ export const DEFAULTS: Params = {
 /** How a comparable's game unlocked, read from its free-text unlock note. */
 export function unlockKind(text: string | undefined): UnlockKind {
   const t = (text ?? '').toLowerCase();
-  const global = /single (simultaneous )?global|simultaneous global|single simultaneous|simultaneous across/.test(t);
+  const global = /simultaneous|single (simultaneous )?global|global unlock/.test(t);
   const rolling = /midnight local|rolling/.test(t);
   if (rolling && global) return 'mixed';
   if (rolling) return 'rolling';
@@ -80,6 +84,11 @@ export function tierOf(text: string | undefined): Tier {
 }
 
 interface Analog { name: string; v1: number; weight: number; logRatio: Map<number, number> }
+
+/** Whether a launch's platform list includes PC on day one. */
+export function launchedOnPC(platforms: string | undefined): boolean {
+  return /\bPC\b/.test(platforms ?? '');
+}
 
 /** A comparable's viewers in the hour before its release day (hour 0), or null when it has no point there. */
 function byHourBefore(k: Comparable, d0: number): number | null {
@@ -100,6 +109,8 @@ export function momentumOf(c: Case, p1: number): number | null {
 export function analogsOf(c: Case, p: Params): Analog[] {
   const p1 = Math.max(1, c.known.find((k) => k.hour === 1)?.viewers ?? 1);
   const targetMomentum = momentumOf(c, p1);
+  // The case schema names no platforms: Grand Theft Auto VI and the practice launches are all console-only.
+  const targetOnPC = c.game.platforms !== undefined && launchedOnPC(c.game.platforms);
   const out: Analog[] = [];
   for (const k of c.comparables ?? []) {
     if (k.name === c.game.name) continue;
@@ -114,14 +125,21 @@ export function analogsOf(c: Case, p: Params): Analog[] {
     const logRatio = new Map<number, number>();
     for (const [h, v] of byHour) if (h >= 2) logRatio.set(h, Math.log(v / v1));
     const sizeGap = (Math.log(v1) - Math.log(p1)) / p.sizeBandwidth;
+    // A floor keeps every analog in play: a target bigger than any comparable (Grand Theft Auto VI may well be) must
+    // not hang its whole forecast on the one or two largest launches.
+    const sizeKernel = p.sizeFloor + (1 - p.sizeFloor) * Math.exp(-0.5 * sizeGap * sizeGap);
     // Momentum into hour 1 (ln of hour 1 over hour 0, the hour before the day starts): a category still climbing at
     // the checkpoint behaves differently from one already fading.
     const v0 = byHourBefore(k, d0);
     const mGap = targetMomentum !== null && v0 !== null ? (Math.log(v1 / v0) - targetMomentum) / p.momentumBandwidth : 0;
+    // A PC launch lets players everywhere in at once and keeps them on through the day; a console-only target
+    // (Grand Theft Auto VI, and every practice launch) follows the console analogs' clock more closely.
+    const platformMatch = launchedOnPC(k.platforms) === targetOnPC ? 1 : p.platformMismatchWeight;
     const weight =
+      platformMatch *
       p.unlockWeight[unlockKind(k.unlock)] *
       p.tierWeight[tierOf(k.unlock)] *
-      Math.exp(-0.5 * sizeGap * sizeGap) *
+      sizeKernel *
       Math.exp(-0.5 * mGap * mGap);
     if (weight > 1e-9) out.push({ name: k.name, v1, weight, logRatio });
   }
