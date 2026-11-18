@@ -28,11 +28,13 @@ interface Case {
   known: Array<{ hour: number; viewers: number }>;
   forecast: Array<{ hour: number }>;
   comparables: Comparable[] | null;
+  history_hourly?: Array<{ from: string; viewers: number }> | null;
   notes?: string;
 }
 
 export interface Params {
   sizeBandwidth: number; // kernel width on ln(hour-1 viewers)
+  momentumBandwidth: number; // kernel width on ln(hour 1 / hour 0)
   kernelBase: number; // smoothing sd (log units) at hour 2
   kernelSlope: number; // added smoothing sd per sqrt(hour - 1)
   shrink: number; // multiplies every analog log ratio (1 = none)
@@ -44,10 +46,14 @@ type UnlockKind = 'rolling' | 'mixed' | 'global' | 'unknown';
 type Tier = 'comparable' | 'contaminated' | 'weak' | 'other';
 
 export const DEFAULTS: Params = {
-  sizeBandwidth: 1.0,
+  // Tuned by leave-one-out over the comparables (each launch forecast from the others), favouring the rolling
+  // midnight-local launches that resemble Grand Theft Auto VI's; kept off the exact optimum, which 11 such launches
+  // cannot pin down.
+  sizeBandwidth: 0.75,
+  momentumBandwidth: 0.4,
   kernelBase: 0.12,
-  kernelSlope: 0.04,
-  shrink: 1,
+  kernelSlope: 0.03,
+  shrink: 0.9,
   unlockWeight: { rolling: 1, mixed: 0.6, unknown: 0.5, global: 0.15 },
   tierWeight: { comparable: 1, contaminated: 0.5, weak: 0.3, other: 0.5 },
 };
@@ -56,7 +62,7 @@ export const DEFAULTS: Params = {
 export function unlockKind(text: string | undefined): UnlockKind {
   const t = (text ?? '').toLowerCase();
   const global = /single (simultaneous )?global|simultaneous global|single simultaneous|simultaneous across/.test(t);
-  const rolling = /midnight local/.test(t);
+  const rolling = /midnight local|rolling/.test(t);
   if (rolling && global) return 'mixed';
   if (rolling) return 'rolling';
   if (global) return 'global';
@@ -75,9 +81,25 @@ export function tierOf(text: string | undefined): Tier {
 
 interface Analog { name: string; v1: number; weight: number; logRatio: Map<number, number> }
 
+/** A comparable's viewers in the hour before its release day (hour 0), or null when it has no point there. */
+function byHourBefore(k: Comparable, d0: number): number | null {
+  for (const pt of k.hourly) if (Math.round((Date.parse(pt.from) - d0) / HOUR_MS) === -1 && pt.viewers > 0) return pt.viewers;
+  return null;
+}
+
+/** The target's momentum ln(hour 1 / hour 0) from its hourly history, or null when hour 0 is missing. */
+export function momentumOf(c: Case, p1: number): number | null {
+  const d0 = Date.parse(c.day_start);
+  for (const row of c.history_hourly ?? []) {
+    if (Math.round((Date.parse(row.from) - d0) / HOUR_MS) === -1 && row.viewers > 0) return Math.log(p1 / row.viewers);
+  }
+  return null;
+}
+
 /** Each comparable's release-day curve as log ratios to its own hour 1, keyed by hour (2..24). */
 export function analogsOf(c: Case, p: Params): Analog[] {
   const p1 = Math.max(1, c.known.find((k) => k.hour === 1)?.viewers ?? 1);
+  const targetMomentum = momentumOf(c, p1);
   const out: Analog[] = [];
   for (const k of c.comparables ?? []) {
     if (k.name === c.game.name) continue;
@@ -92,8 +114,15 @@ export function analogsOf(c: Case, p: Params): Analog[] {
     const logRatio = new Map<number, number>();
     for (const [h, v] of byHour) if (h >= 2) logRatio.set(h, Math.log(v / v1));
     const sizeGap = (Math.log(v1) - Math.log(p1)) / p.sizeBandwidth;
+    // Momentum into hour 1 (ln of hour 1 over hour 0, the hour before the day starts): a category still climbing at
+    // the checkpoint behaves differently from one already fading.
+    const v0 = byHourBefore(k, d0);
+    const mGap = targetMomentum !== null && v0 !== null ? (Math.log(v1 / v0) - targetMomentum) / p.momentumBandwidth : 0;
     const weight =
-      p.unlockWeight[unlockKind(k.unlock)] * p.tierWeight[tierOf(k.unlock)] * Math.exp(-0.5 * sizeGap * sizeGap);
+      p.unlockWeight[unlockKind(k.unlock)] *
+      p.tierWeight[tierOf(k.unlock)] *
+      Math.exp(-0.5 * sizeGap * sizeGap) *
+      Math.exp(-0.5 * mGap * mGap);
     if (weight > 1e-9) out.push({ name: k.name, v1, weight, logRatio });
   }
   return out;
